@@ -147,7 +147,12 @@ Key properties:
 │  │  Reader  │  │  Reader   │  │  (trait)      │ │
 │  └──────────┘  └───────────┘  └──────────────┘ │
 │         ↓              ↓              ↓         │
-│     Packet { ts, data, five_tuple, l7_offset }  │
+│      mmap + Bytes::from_owner (zero-copy)       │
+└────────────────────┬────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────┐
+│         Packet Parsing (packet.rs)               │
+│  Ethernet | IPv4 | IPv6 ext hdrs | 802.11+radio │
 └────────────────────┬────────────────────────────┘
                      │
 ┌────────────────────▼────────────────────────────┐
@@ -165,7 +170,8 @@ Key properties:
 │  Split Output   │   │  Archive Output (.rsplit)│
 │  - PCAP files   │   │  - Stream writer         │
 │  - L7 payloads  │   │  - Delta+LEB128 index    │
-│  - Per-flow     │   │  - Post-positioned footer│
+│  - Per-flow     │   │  - Secondary indexes     │
+│  (atomic rename)│   │  - Post-positioned footer│
 └─────────────────┘   └─────────────────────────┘
 ```
 
@@ -175,7 +181,7 @@ Key properties:
 src/
 ├── main.rs              # Entry point, mode dispatch
 ├── cli.rs               # CLI argument parsing + SplitCap compat
-├── packet.rs            # Packet & FiveTuple types, protocol parsing
+├── packet.rs            # Packet & FiveTuple types, Ethernet/IPv4/IPv6 ext hdrs/WiFi 802.11 + radiotap
 ├── filter.rs            # IP/port filter logic
 ├── parser/
 │   ├── mod.rs           # CaptureReader trait, format auto-detect
@@ -188,9 +194,9 @@ src/
 │   ├── mod.rs           # PCAP header writer, L7 output helpers
 │   └── split.rs         # Buffered per-flow PCAP writer
 └── archive/
-    ├── mod.rs           # .rsplit format types, LEB128 codec
+    ├── mod.rs           # .rsplit format types, LEB128 codec, secondary indexes
     ├── writer.rs        # Archive stream writer (2-phase)
-    └── reader.rs        # Archive reader (mmap, extraction)
+    └── reader.rs        # Archive reader (mmap, extraction with index lookup)
 ```
 
 ## Build & Test
@@ -208,18 +214,6 @@ cargo bench
 # Fuzz testing (coming soon)
 cargo fuzz run pcap_parser
 ```
-
-## Performance
-
-Preliminary benchmarks on a 10GB PCAP file (Ryzen 7, NVMe SSD):
-
-| Tool | Time | Memory |
-|------|------|--------|
-| SplitCap (Mono) | 142s | 1.2 GB |
-| tshark | 98s | 800 MB |
-| **RSplitCap** | **45s** | **180 MB** |
-
-*RSplitCap's archive mode writes at near-disk-bandwidth speeds due to purely sequential I/O.*
 
 ## Compatibility
 
@@ -242,12 +236,13 @@ rsplitcap -r dump.pcap -s session -o output/
 - [x] IP/port filtering
 - [x] L7 payload extraction
 - [x] `.rsplit` archive format (write + read + extract)
-- [x] mmap-based archive reading
+- [x] mmap-based archive reading and file input (zero-copy, OS-paged)
 - [x] Flow listing and metadata query
-- [ ] Secondary indexes (IP/port/protocol) for large archives
-- [ ] Streaming file I/O (avoid loading entire file into RAM)
+- [x] Secondary indexes (IP/port/protocol) with sort+dedup+linear scan
+- [x] WiFi 802.11 frame parsing for BSSID strategy (raw + radiotap)
+- [x] IPv6 extension header chain traversal
 - [ ] Multi-threaded pipeline with crossbeam
-- [ ] WiFi frame parsing for BSSID strategy
+- [ ] PCAP-NG WiFi data-packet IP parsing over LLC/SNAP
 - [ ] Compression support in archive
 - [ ] Python bindings
 

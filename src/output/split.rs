@@ -41,12 +41,21 @@ struct WriterState {
 impl SplitWriter {
     pub fn new(
         output_dir: PathBuf,
+        input_prefix: Option<String>,
         link_type: u32,
         output_mode: OutputMode,
         buffer_size: usize,
         max_writers: u32,
     ) -> Result<Self> {
-        std::fs::create_dir_all(&output_dir)?;
+        // If prefix is specified, create a subdirectory per input file
+        let output_dir = if let Some(ref prefix) = input_prefix {
+            let dir = output_dir.join(prefix);
+            std::fs::create_dir_all(&dir)?;
+            dir
+        } else {
+            std::fs::create_dir_all(&output_dir)?;
+            output_dir
+        };
         Ok(Self {
             output_dir,
             output_mode,

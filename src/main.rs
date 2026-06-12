@@ -210,13 +210,17 @@ fn run_split_legacy(
         classify_elapsed
     );
 
+    // Subdirectory per input file to avoid name collisions
+    let input_stem = input_stem_for_dir(input_path);
+    let out_dir = output_dir.join(&input_stem);
+
     // Phase 2: write output
     match output_type {
         OutputType::Pcap => {
-            write_split_pcap(output_dir, flow_mgr.into_flows(), link_type, cli.buffer_bytes)?;
+            write_split_pcap(&out_dir, flow_mgr.into_flows(), link_type, cli.buffer_bytes)?;
         }
         OutputType::L7 => {
-            write_split_l7(output_dir, flow_mgr.into_flows(), cli.buffer_bytes)?;
+            write_split_l7(&out_dir, flow_mgr.into_flows(), cli.buffer_bytes)?;
         }
     }
 
@@ -272,9 +276,11 @@ fn run_split_pipelined(
     });
 
     // ── Consumer: filter, classify, write via SplitWriter ──
+    let input_stem = input_stem_for_dir(input_path);
     let mut flow_mgr = FlowManager::new(group, cli.max_sessions);
     let mut split_writer = SplitWriter::new(
         output_dir.clone(),
+        Some(input_stem),
         link_type,
         output_mode,
         cli.buffer_bytes,
@@ -333,6 +339,17 @@ fn run_split_pipelined(
     tracing::info!("Done in {:?}", total_elapsed);
 
     Ok(())
+}
+
+/// Extract the file stem for use as output subdirectory prefix.
+fn input_stem_for_dir(path: &Path) -> String {
+    if path.as_os_str() == "-" {
+        return "stdin".to_string();
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn build_filter(cli: &cli::Cli) -> Result<Filter> {

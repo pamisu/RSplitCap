@@ -115,6 +115,138 @@ fn test_leb128_codec_roundtrip() {
 }
 
 #[test]
+fn test_wifi_radiotap_parsing() {
+    // Build a minimal radiotap + 802.11 data frame
+    let radiotap_hdr = {
+        let mut b = Vec::new();
+        b.push(0x00); // version
+        b.push(0x00); // pad
+        b.extend_from_slice(&16u16.to_le_bytes()); // length = 16
+        b.extend_from_slice(&0u32.to_le_bytes()); // present flags
+        b.extend_from_slice(&[0u8; 8]); // padding to reach 16
+        b
+    };
+    assert_eq!(radiotap_hdr.len(), 16);
+
+    // 802.11 Data frame (24 bytes header)
+    // Frame Control: Data, ToDS=0, FromDS=0
+    let fc: u16 = 0x02 << 2; // type=Data
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&fc.to_le_bytes()); // Frame Control
+    frame.extend_from_slice(&0u16.to_le_bytes()); // Duration
+    frame.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]); // Addr1 (DA)
+    frame.extend_from_slice(&[0x11, 0x12, 0x13, 0x14, 0x15, 0x16]); // Addr2 (SA)
+    frame.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // Addr3 (BSSID)
+    frame.extend_from_slice(&0u16.to_le_bytes()); // Seq Control
+
+    let mut data = radiotap_hdr;
+    data.extend_from_slice(&frame);
+
+    let pkt = rsplitcap::packet::Packet::from_pcap_record(0, 0, data.len() as u32, bytes::Bytes::from(data), 127);
+    assert_eq!(pkt.src_mac, Some([0x11, 0x12, 0x13, 0x14, 0x15, 0x16]));
+    assert_eq!(pkt.dst_mac, Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]));
+    assert_eq!(pkt.bssid, Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+}
+
+#[test]
+fn test_wifi_management_frame_bssid() {
+    // Build a minimal 802.11 Beacon frame (Management, subtype=Beacon)
+    // Frame Control: Management, ToDS=0, FromDS=0
+    let fc: u16 = (0x00 << 2) | (0x08 << 4); // type=Management, subtype=Beacon
+    let mut data = Vec::new();
+    data.extend_from_slice(&fc.to_le_bytes()); // Frame Control
+    data.extend_from_slice(&0u16.to_le_bytes()); // Duration
+    data.extend_from_slice(&[0xFF; 6]); // Addr1 (DA = broadcast)
+    data.extend_from_slice(&[0x22, 0x22, 0x22, 0x22, 0x22, 0x22]); // Addr2 (SA = AP MAC)
+    data.extend_from_slice(&[0x33, 0x33, 0x33, 0x33, 0x33, 0x33]); // Addr3 (BSSID)
+    data.extend_from_slice(&0u16.to_le_bytes()); // Seq Control
+
+    let pkt = rsplitcap::packet::Packet::from_pcap_record(0, 0, data.len() as u32, bytes::Bytes::from(data), 105);
+    assert_eq!(pkt.src_mac, Some([0x22, 0x22, 0x22, 0x22, 0x22, 0x22]));
+    assert_eq!(pkt.dst_mac, Some([0xFF; 6]));
+    assert_eq!(pkt.bssid, Some([0x33, 0x33, 0x33, 0x33, 0x33, 0x33]));
+}
+
+#[test]
+fn test_wifi_malformed_no_panic() {
+    // Malformed/short WiFi frames should not panic
+    use bytes::Bytes;
+    let cases: Vec<(u32, Vec<u8>)> = vec![
+        (105, vec![]),
+        (105, vec![0x00; 3]),
+        (105, vec![0x00; 15]),
+        (127, vec![]),
+        (127, vec![0x00, 0x00, 0x04, 0x00]), // radiotap header only (length=4), no frame
+        (127, vec![0x00, 0x00, 0x10, 0x00]), // empty radiotap, length=16 but too short
+    ];
+    for (link_type, data) in cases {
+        let data_len = data.len();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = rsplitcap::packet::Packet::from_pcap_record(0, 0, data_len as u32, Bytes::from(data), link_type);
+        }));
+        assert!(result.is_ok(), "WiFi parsing panicked on link_type={link_type}, data_len={data_len}");
+    }
+}
+
+#[test]
+fn test_ipv6_ext_hdr_via_ethernet() {
+    // Ethernet + IPv6 with extension headers → TCP
+    let mut pkt = Vec::new();
+    // Ethernet header
+    pkt.extend_from_slice(&[0x00u8; 6]); // dst mac
+    pkt.extend_from_slice(&[0x11u8; 6]); // src mac
+    pkt.extend_from_slice(&[0x86, 0xDD]); // EtherType = IPv6
+
+    let ipv6_start = pkt.len();
+    // IPv6 fixed header
+    pkt.push(0x60); // version=6
+    pkt.extend_from_slice(&[0x00, 0x00, 0x00]); // traffic class + flow label
+    let payload_len_pos = pkt.len();
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // payload length placeholder
+    pkt.push(0); // Next Header = Hop-by-Hop Options
+    pkt.push(64); // Hop Limit
+    pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]); // src
+    pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]); // dst
+
+    // Hop-by-Hop Options (8 bytes)
+    pkt.push(43); // Next Header = Routing
+    pkt.push(0);  // Ext Len = 0 → 8 bytes
+    pkt.extend_from_slice(&[0u8; 6]);
+
+    // Routing Header (8 bytes)
+    pkt.push(6);  // Next Header = TCP
+    pkt.push(0);  // Ext Len = 0 → 8 bytes
+    pkt.push(0);  // Routing Type
+    pkt.push(0);  // Segments Left
+    pkt.extend_from_slice(&[0u8; 4]);
+
+    // TCP header
+    pkt.extend_from_slice(&12345u16.to_be_bytes()); // src port
+    pkt.extend_from_slice(&80u16.to_be_bytes());     // dst port
+    pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // seq=1
+    pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ack=0
+    pkt.push(0x50); // data offset = 5 * 4 = 20
+    pkt.push(0x10); // flags = ACK
+    pkt.extend_from_slice(&[0x70, 0x00]); // window
+    pkt.extend_from_slice(&[0x00, 0x00]); // checksum
+    pkt.extend_from_slice(&[0x00, 0x00]); // urgent ptr
+    // TCP payload
+    pkt.extend_from_slice(b"HELLO");
+
+    // Fix payload length
+    let payload_len = (pkt.len() - ipv6_start - 40) as u16;
+    pkt[payload_len_pos..payload_len_pos + 2].copy_from_slice(&payload_len.to_be_bytes());
+
+    let packet = rsplitcap::packet::Packet::from_pcap_record(0, 0, pkt.len() as u32, bytes::Bytes::from(pkt), 1);
+    let ft = packet.five_tuple.unwrap();
+    assert_eq!(ft.protocol, 6, "Should find TCP protocol after extension headers");
+    assert_eq!(ft.src_port, 12345);
+    assert_eq!(ft.dst_port, 80);
+    assert!(packet.l7_offset.is_some());
+    assert_eq!(packet.l7_data().unwrap(), b"HELLO");
+}
+
+#[test]
 fn test_flow_entry_roundtrip() {
     use rsplitcap::archive::FlowEntry;
 

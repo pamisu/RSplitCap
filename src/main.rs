@@ -20,10 +20,11 @@ use crate::parser::open_reader;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use std::fs;
+use memmap2::Mmap;
+use std::fs::{self, File};
 use std::io::Read;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn main() -> Result<()> {
@@ -121,7 +122,7 @@ fn walk_dir(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn is_pcap_file(path: &PathBuf) -> bool {
+fn is_pcap_file(path: &Path) -> bool {
     path.extension()
         .map(|e| {
             let s = e.to_str().unwrap_or("");
@@ -183,7 +184,7 @@ fn run_split(
             flow_mgr.add_packet(key, &packet);
         }
 
-        if processed % 1_000_000 == 0 {
+        if processed.is_multiple_of(1_000_000) {
             tracing::info!(
                 "Processed {} packets, {} flows",
                 processed,
@@ -225,8 +226,13 @@ fn read_input(path: &str) -> Result<Bytes> {
             .context("Failed to read from stdin")?;
         Ok(Bytes::from(buf))
     } else {
-        let data = fs::read(path).context("Failed to read input file")?;
-        Ok(Bytes::from(data))
+        let file = File::open(path).context("Failed to open input file")?;
+        // Safety: mmap gives raw access to file bytes. The file could be modified
+        // externally while mapped, but for a read-only PCAP processing tool this is
+        // acceptable — the OS guarantees consistency for the mapped pages.
+        let mmap = unsafe { Mmap::map(&file).context("Failed to mmap input file")? };
+        tracing::debug!("Mapped {} bytes from {:?}", mmap.len(), path);
+        Ok(Bytes::from_owner(mmap))
     }
 }
 
@@ -325,7 +331,7 @@ fn run_archive(cli: &cli::Cli, group: &GroupArg) -> Result<()> {
             writer.write_packet(key, &packet)?;
         }
 
-        if processed % 1_000_000 == 0 {
+        if processed.is_multiple_of(1_000_000) {
             tracing::info!(
                 "Processed {} packets, {} flows",
                 processed,

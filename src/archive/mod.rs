@@ -58,7 +58,7 @@ impl FileHeader {
 }
 
 /// Flow Table entry — fixed 96 bytes per flow.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct FlowEntry {
     pub flow_id: u64,
@@ -77,29 +77,8 @@ pub struct FlowEntry {
     pub total_bytes: u64,
 }
 
-impl Default for FlowEntry {
-    fn default() -> Self {
-        Self {
-            flow_id: 0,
-            protocol: 0,
-            _pad1: [0; 7],
-            src_ip: [0; 16],
-            dst_ip: [0; 16],
-            src_port: 0,
-            dst_port: 0,
-            _pad2: [0; 4],
-            offset_list_offset: 0,
-            offset_list_size: 0,
-            packet_count: 0,
-            start_ts_us: 0,
-            end_ts_us: 0,
-            total_bytes: 0,
-        }
-    }
-}
-
 impl FlowEntry {
-    pub fn to_bytes(&self) -> [u8; FLOW_ENTRY_SIZE] {
+    pub fn to_bytes(self) -> [u8; FLOW_ENTRY_SIZE] {
         let mut buf = [0u8; FLOW_ENTRY_SIZE];
         let mut pos = 0;
         buf[pos..pos + 8].copy_from_slice(&self.flow_id.to_le_bytes());
@@ -322,6 +301,7 @@ pub fn decode_offsets(data: &[u8], count: usize) -> Vec<u64> {
 pub const SEC_IDX_HEADER_SIZE: usize = 36;
 
 /// Build all three secondary indexes from flow entries.
+#[derive(Default)]
 pub struct SecondaryIndexBuilder {
     /// (ip_bytes, flow_id)
     ip_entries: Vec<([u8; 16], u64)>,
@@ -333,11 +313,7 @@ pub struct SecondaryIndexBuilder {
 
 impl SecondaryIndexBuilder {
     pub fn new() -> Self {
-        Self {
-            ip_entries: Vec::new(),
-            port_entries: Vec::new(),
-            proto_entries: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn add_flow(&mut self, entry: &FlowEntry) {

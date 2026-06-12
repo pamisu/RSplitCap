@@ -36,12 +36,12 @@ impl Filter {
     /// IP and port filters are AND-combined: both must match if both are set.
     pub fn matches(&self, packet: &Packet) -> bool {
         let ip_ok = self.ip_list.is_empty()
-            || packet.five_tuple.map_or(false, |ft| {
+            || packet.five_tuple.is_some_and(|ft| {
                 self.ip_list.iter().any(|ip| *ip == ft.src_ip || *ip == ft.dst_ip)
             });
 
         let port_ok = self.port_list.is_empty()
-            || packet.five_tuple.map_or(false, |ft| {
+            || packet.five_tuple.is_some_and(|ft| {
                 self.port_list
                     .iter()
                     .any(|p| *p == ft.src_port || *p == ft.dst_port)

@@ -7,7 +7,7 @@ RSplitCap is a Rust rewrite of SplitCap (Windows PCAP splitting tool), with adde
 ```bash
 cargo build                    # Debug build
 cargo build --release          # Release build (LTO, single codegen unit)
-cargo test                     # Run all tests
+cargo test                     # Run all tests (12 tests: 6 integration + 6 fuzz/robustness)
 cargo clippy -- -D warnings    # Lint
 RUST_LOG=debug cargo run -- <args>  # Verbose run
 ```
@@ -17,7 +17,7 @@ RUST_LOG=debug cargo run -- <args>  # Verbose run
 2. **Parser** (`src/parser/`) — `CaptureReader` trait, PCAP + PCAP-NG (SHB/IDB/EPB/SPB)
 3. **Filter** (`src/filter.rs`) — IP + port AND-logic whitelist
 4. **Flow Manager** (`src/flow/`) — grouping strategies, LRU eviction via generation counter
-5. **Output** — Split mode (per-flow PCAP files), L7 mode (payload only), Archive mode (`.rsplit`)
+5. **Output** — Split mode (per-flow PCAP/L7), Archive mode (`.rsplit` with secondary indexes)
 
 ## Key Design Decisions
 - Entire input loaded into `Bytes` (zero-copy). TODO: streaming I/O for >memory files.
@@ -25,6 +25,8 @@ RUST_LOG=debug cargo run -- <args>  # Verbose run
 - FlowEntry is fixed 96 bytes — enables O(1) random access in Flow Table.
 - IP addresses stored as 16 bytes (IPv4-mapped IPv6) for uniform handling.
 - `-s seconds N` and `-s packets N` use the `-s` flag with a sub-argument — manually parsed.
+- Secondary indexes: sorted key→[flow_id] maps for IP/port/protocol in archive (binary-searchable).
+- All file writes use atomic temp-file + rename pattern to prevent corruption on interrupt.
 
 ## Module Map
 ```
@@ -34,7 +36,11 @@ main.rs ── cli ── filter ── flow (strategy + manager) ── output 
 
 ## Known Gaps
 - BSSID strategy returns empty (no WiFi frame parser yet)
-- No secondary indexes in archive (IP/port/protocol scans are linear O(n))
-- No streaming file I/O (memory-maps or loads entire file)
-- `OutputWriter` trait / `SplitWriter` struct exist but main.rs uses direct `write_flow_pcap` instead
-- PCAP-NG: limited to single interface, no name resolution blocks
+- No streaming file I/O (memory-maps or loads entire file into Bytes)
+- PCAP-NG: limited to single interface, no name resolution blocks, no extension headers for IPv6
+- Pipeline concurrency not implemented (crossbeam-channel dependency available but unused)
+- LRU eviction is O(n) per eviction; could use a linked hash map for O(1)
+
+## Test Coverage
+- `tests/integration.rs`: 6 tests (split, filter, L7, PCAP-NG, archive roundtrip, list-flows)
+- `tests/fuzz_parsers.rs`: 6 tests (random data PCAP/PCAP-NG parsers, malformed packets, LEB128 codec, FlowEntry roundtrip, corrupt archive rejection)

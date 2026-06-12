@@ -128,8 +128,9 @@ Key properties:
 | `--filter-port <p>` | Extract: filter by port |
 | `--filter-proto <p>` | Extract: filter by protocol (`tcp`/`udp`/`icmp`) |
 | `--no-secondary-index` | Skip secondary index generation |
-| `--threads <n>` | Worker thread count |
+| `--threads <n>` | Worker thread count (for future multi-threaded classification) |
 | `--no-mmap` | Disable memory mapping |
+| `--no-pipeline` | Use legacy accumulate-then-write mode |
 | `-v, --verbose` | Verbose logging |
 
 ## Architecture
@@ -241,7 +242,7 @@ rsplitcap -r dump.pcap -s session -o output/
 - [x] Secondary indexes (IP/port/protocol) with sort+dedup+linear scan
 - [x] WiFi 802.11 frame parsing for BSSID strategy (raw + radiotap)
 - [x] IPv6 extension header chain traversal
-- [ ] Multi-threaded pipeline with crossbeam
+- [x] Multi-threaded pipeline (parser thread + streaming output via SplitWriter)
 - [ ] PCAP-NG WiFi data-packet IP parsing over LLC/SNAP
 - [ ] Compression support in archive
 - [ ] Python bindings

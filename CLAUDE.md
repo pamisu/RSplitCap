@@ -22,12 +22,14 @@ RUST_LOG=debug cargo run -- <args>  # Verbose run
 
 ## Key Design Decisions
 - Input files are mmap'd via `memmap2` + `Bytes::from_owner` — zero-copy, OS-managed paging for >memory files.
+- Split mode uses pipelined streaming: parser in background thread (crossbeam bounded channel) → classify + write in main thread via `SplitWriter`. Packets written as they arrive, not accumulated.
 - Archive uses 2-phase write: sequential packets → post-positioned indexes (Delta+LEB128).
 - FlowEntry is fixed 96 bytes — enables O(1) random access in Flow Table.
 - IP addresses stored as 16 bytes (IPv4-mapped IPv6) for uniform handling.
 - `-s seconds N` and `-s packets N` use the `-s` flag with a sub-argument — manually parsed.
 - Secondary indexes: sorted key→[flow_id] maps for IP/port/protocol in archive (binary-searchable).
 - All file writes use atomic temp-file + rename pattern to prevent corruption on interrupt.
+- `--no-pipeline` flag falls back to legacy accumulate-then-write mode.
 
 ## Module Map
 ```
@@ -37,7 +39,6 @@ main.rs ── cli ── filter ── flow (strategy + manager) ── output 
 ```
 
 ## Known Gaps
-- Pipeline concurrency not implemented (crossbeam-channel dependency available but unused)
 - LRU eviction is O(n) per eviction (fast in practice for default 10k max_sessions)
 - PCAP-NG: single interface only, no name resolution blocks
 - No WiFi data-frame IP parsing over LLC/SNAP (BSSID/mac extraction works; five-tuple returns None)

@@ -7,6 +7,8 @@ use std::path::Path;
 
 mod split;
 
+pub use split::{OutputMode, SplitWriter};
+
 /// Write a complete flow to a PCAP file using atomic temp-file + rename.
 pub fn write_flow_pcap(
     output_dir: &Path,

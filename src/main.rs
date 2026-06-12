@@ -15,11 +15,12 @@ mod parser;
 use crate::cli::{GroupArg, Mode, OutputType};
 use crate::filter::Filter;
 use crate::flow::FlowManager;
-use crate::output::{write_flow_l7, write_flow_pcap};
-use crate::parser::open_reader;
+use crate::output::{write_flow_l7, write_flow_pcap, OutputMode, SplitWriter};
+use crate::parser::{open_reader, CaptureReader, ParseError};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
+use crossbeam_channel as cb;
 use memmap2::Mmap;
 use std::fs::{self, File};
 use std::io::Read;
@@ -142,20 +143,27 @@ fn run_split(
     output_dir: &PathBuf,
     input_path: &PathBuf,
 ) -> Result<()> {
+    if cli.no_pipeline {
+        return run_split_legacy(cli, group, output_type, output_dir, input_path);
+    }
+    run_split_pipelined(cli, group, output_type, output_dir, input_path)
+}
+
+/// Legacy split mode: accumulate all packets in memory, then write.
+fn run_split_legacy(
+    cli: &cli::Cli,
+    group: &GroupArg,
+    output_type: OutputType,
+    output_dir: &PathBuf,
+    input_path: &PathBuf,
+) -> Result<()> {
     // Clean output directory if requested
     if cli.clean_output && output_dir.exists() {
         fs::remove_dir_all(output_dir)?;
     }
 
     // Build filter
-    let mut filter = Filter::new();
-    for ip_str in &cli.ip_filters {
-        let ip: IpAddr = ip_str.parse().context("Invalid IP filter")?;
-        filter.add_ip(ip);
-    }
-    for &port in &cli.port_filters {
-        filter.add_port(port);
-    }
+    let filter = build_filter(cli)?;
 
     // Read input
     let data = read_input(&input_path.to_string_lossy())?;
@@ -218,6 +226,127 @@ fn run_split(
     Ok(())
 }
 
+/// Pipelined split mode: parse in background thread, classify + write in main thread.
+/// Uses bounded crossbeam channel for backpressure, SplitWriter for streaming output.
+fn run_split_pipelined(
+    cli: &cli::Cli,
+    group: &GroupArg,
+    output_type: OutputType,
+    output_dir: &PathBuf,
+    input_path: &PathBuf,
+) -> Result<()> {
+    // Clean output directory if requested
+    if cli.clean_output && output_dir.exists() {
+        fs::remove_dir_all(output_dir)?;
+    }
+    fs::create_dir_all(output_dir)?;
+
+    let filter = build_filter(cli)?;
+    let output_mode = match output_type {
+        OutputType::Pcap => OutputMode::Pcap,
+        OutputType::L7 => OutputMode::L7,
+    };
+
+    // Read input
+    let data = read_input(&input_path.to_string_lossy())?;
+    let file_size = data.len();
+    tracing::info!("Read {} bytes from {:?}", file_size, input_path);
+
+    let start = Instant::now();
+
+    let mut reader = open_reader(data)?;
+    let link_type = reader.link_type();
+
+    // Bounded channel: 4096 packets deep for backpressure
+    let (tx, rx) = cb::bounded::<Result<crate::packet::Packet, ParseError>>(4096);
+
+    // ── Producer thread: parse packets ──
+    let producer = std::thread::spawn(move || -> Result<(), ParseError> {
+        while let Some(packet) = reader.next_packet()? {
+            if tx.send(Ok(packet)).is_err() {
+                // Receiver dropped (consumer finished early)
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    // ── Consumer: filter, classify, write via SplitWriter ──
+    let mut flow_mgr = FlowManager::new(group, cli.max_sessions);
+    let mut split_writer = SplitWriter::new(
+        output_dir.clone(),
+        link_type,
+        output_mode,
+        cli.buffer_bytes,
+        cli.max_sessions,
+    )?;
+
+    let mut processed = 0u64;
+    let mut filtered = 0u64;
+
+    for result in rx {
+        let packet = result.context("Parse error in producer thread")?;
+        processed += 1;
+
+        if !filter.matches(&packet) {
+            filtered += 1;
+            continue;
+        }
+
+        let keys = flow_mgr.classify(&packet);
+        for key in &keys {
+            // Track flow metadata (for LRU eviction, stats)
+            flow_mgr.add_packet(key, &packet);
+            // Write packet immediately (streaming output)
+            split_writer.write_packet_for_key(key, &packet)?;
+        }
+
+        if processed.is_multiple_of(1_000_000) {
+            tracing::info!(
+                "Processed {} packets, {} flows",
+                processed,
+                flow_mgr.flow_count()
+            );
+        }
+    }
+
+    // Join producer thread and propagate errors
+    match producer.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => anyhow::bail!("Producer thread panicked"),
+    }
+
+    let classify_elapsed = start.elapsed();
+    tracing::info!(
+        "Pipelined processing: {} packets ({} filtered), {} flows in {:?}",
+        processed,
+        filtered,
+        flow_mgr.flow_count(),
+        classify_elapsed
+    );
+
+    // Finalize all split files with atomic rename
+    split_writer.close()?;
+
+    let total_elapsed = start.elapsed();
+    tracing::info!("Done in {:?}", total_elapsed);
+
+    Ok(())
+}
+
+fn build_filter(cli: &cli::Cli) -> Result<Filter> {
+    let mut filter = Filter::new();
+    for ip_str in &cli.ip_filters {
+        let ip: IpAddr = ip_str.parse().context("Invalid IP filter")?;
+        filter.add_ip(ip);
+    }
+    for &port in &cli.port_filters {
+        filter.add_port(port);
+    }
+    Ok(filter)
+}
+
 fn read_input(path: &str) -> Result<Bytes> {
     if path == "-" {
         let mut buf = Vec::new();
@@ -265,24 +394,6 @@ fn write_split_l7(
     }
     tracing::info!("L7 output written to {:?}", output_dir);
     Ok(())
-}
-
-fn sanitize_filename(name: &str) -> String {
-    name.replace(
-        |c: char| {
-            c.is_ascii_control()
-                || c == '/'
-                || c == '\\'
-                || c == ':'
-                || c == '*'
-                || c == '?'
-                || c == '"'
-                || c == '<'
-                || c == '>'
-                || c == '|'
-        },
-        "_",
-    )
 }
 
 /// ── Archive mode: stream packets into a single .rsplit file ──

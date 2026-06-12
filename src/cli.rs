@@ -91,6 +91,10 @@ pub struct Cli {
     #[arg(long = "no-mmap")]
     pub no_mmap: bool,
 
+    /// Disable pipelined streaming output (fall back to accumulate-then-write)
+    #[arg(long = "no-pipeline")]
+    pub no_pipeline: bool,
+
     /// Verbose output
     #[arg(long = "verbose", short = 'v')]
     pub verbose: bool,

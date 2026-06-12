@@ -90,9 +90,8 @@ fn test_split_session() {
 
     assert!(status.success());
 
-    // Output is in a subdirectory named after the input file stem
-    let flow_dir = output.join("test");
-    let mut files: Vec<_> = fs::read_dir(&flow_dir)
+    // Output files are prefixed with input file stem
+    let mut files: Vec<_> = fs::read_dir(&output)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
@@ -124,8 +123,7 @@ fn test_split_filter() {
 
     assert!(status.success());
 
-    let flow_dir = output.join("test");
-    let files: Vec<_> = fs::read_dir(&flow_dir)
+    let files: Vec<_> = fs::read_dir(&output)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
@@ -152,9 +150,8 @@ fn test_l7_output() {
 
     assert!(status.success());
 
-    // Check L7 files have content (files are in subdirectory named after input stem)
-    let flow_dir = output.join("test");
-    for entry in fs::read_dir(&flow_dir).unwrap() {
+    // Check L7 files have content
+    for entry in fs::read_dir(&output).unwrap() {
         let entry = entry.unwrap();
         let content = fs::read(entry.path()).unwrap();
         assert!(!content.is_empty(), "L7 file should not be empty");

@@ -18,6 +18,8 @@ pub struct SplitWriter {
     link_type: u32,
     buffer_size: usize,
     max_writers: u32,
+    /// Optional input file stem, prepended to output filenames.
+    input_prefix: Option<String>,
     writers: HashMap<String, WriterState>,
     /// Track temp paths for atomic rename on close.
     temp_paths: HashMap<String, (PathBuf, PathBuf)>, // (tmp, final)
@@ -47,21 +49,14 @@ impl SplitWriter {
         buffer_size: usize,
         max_writers: u32,
     ) -> Result<Self> {
-        // If prefix is specified, create a subdirectory per input file
-        let output_dir = if let Some(ref prefix) = input_prefix {
-            let dir = output_dir.join(prefix);
-            std::fs::create_dir_all(&dir)?;
-            dir
-        } else {
-            std::fs::create_dir_all(&output_dir)?;
-            output_dir
-        };
+        std::fs::create_dir_all(&output_dir)?;
         Ok(Self {
             output_dir,
             output_mode,
             link_type,
             buffer_size,
             max_writers,
+            input_prefix,
             writers: HashMap::new(),
             temp_paths: HashMap::new(),
             lru_gen: 0,
@@ -88,12 +83,16 @@ impl SplitWriter {
             }
         } else {
             let safe = sanitize_key(group_key);
+            let fname = match &self.input_prefix {
+                Some(prefix) => format!("{prefix}_{safe}"),
+                None => safe,
+            };
             let ext = match self.output_mode {
                 OutputMode::Pcap => "pcap",
                 OutputMode::L7 => "l7",
             };
-            let final_path = self.output_dir.join(format!("{safe}.{ext}"));
-            let tmp_path = self.output_dir.join(format!(".{safe}.{ext}.tmp"));
+            let final_path = self.output_dir.join(format!("{fname}.{ext}"));
+            let tmp_path = self.output_dir.join(format!(".{fname}.{ext}.tmp"));
 
             let file = File::create(&tmp_path)?;
             let mut writer = BufWriter::with_capacity(self.buffer_size, file);
@@ -154,7 +153,6 @@ impl SplitWriter {
         for (_, (tmp, final_path)) in self.temp_paths.drain() {
             if tmp.exists() {
                 if self.output_mode == OutputMode::L7 {
-                    // For L7, only keep files with content
                     let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
                     if size == 0 {
                         let _ = std::fs::remove_file(&tmp);
@@ -183,14 +181,10 @@ impl SplitWriter {
         if let Some(key) = lru_key {
             if let Some(state) = self.writers.remove(&key) {
                 drop(state.writer);
-                // Keep the temp file — it may get more packets later.
-                // If not, it'll be renamed on close.
-                // Re-open if this key gets another packet.
             }
         }
     }
 
-    /// Number of currently open writers.
     pub fn writer_count(&self) -> usize {
         self.writers.len()
     }
@@ -236,6 +230,7 @@ fn sanitize_key(key: &str) -> String {
                 || c == '<'
                 || c == '>'
                 || c == '|'
+                || c == '.' // replace IP address dots with underscores
         },
         "_",
     )

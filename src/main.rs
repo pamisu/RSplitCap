@@ -15,7 +15,7 @@ mod parser;
 use crate::cli::{GroupArg, Mode, OutputType};
 use crate::filter::Filter;
 use crate::flow::FlowManager;
-use crate::output::{write_flow_l7, write_flow_pcap, OutputMode, SplitWriter};
+use crate::output::{write_flow_l7_prefixed, write_flow_pcap_prefixed, OutputMode, SplitWriter};
 use crate::parser::{open_reader, CaptureReader, ParseError};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -210,19 +210,25 @@ fn run_split_legacy(
         classify_elapsed
     );
 
-    // Subdirectory per input file to avoid name collisions
+    // Prefix output filenames with input file stem to avoid name collisions
     let input_stem = input_stem_for_dir(input_path);
-    let out_dir = output_dir.join(&input_stem);
+    let prefix: Option<&str> = Some(input_stem.as_str());
 
     // Phase 2: write output
-    match output_type {
-        OutputType::Pcap => {
-            write_split_pcap(&out_dir, flow_mgr.into_flows(), link_type, cli.buffer_bytes)?;
+    for (_, flow) in flow_mgr.into_flows() {
+        if flow.packet_count == 0 {
+            continue;
         }
-        OutputType::L7 => {
-            write_split_l7(&out_dir, flow_mgr.into_flows(), cli.buffer_bytes)?;
+        match output_type {
+            OutputType::Pcap => {
+                write_flow_pcap_prefixed(output_dir, &flow, link_type, cli.buffer_bytes, prefix)?;
+            }
+            OutputType::L7 => {
+                write_flow_l7_prefixed(output_dir, &flow, cli.buffer_bytes, prefix)?;
+            }
         }
     }
+    tracing::info!("{:?} output written to {:?}", output_type, output_dir);
 
     let total_elapsed = start.elapsed();
     tracing::info!("Done in {:?}", total_elapsed);
@@ -380,37 +386,6 @@ fn read_input(path: &str) -> Result<Bytes> {
         tracing::debug!("Mapped {} bytes from {:?}", mmap.len(), path);
         Ok(Bytes::from_owner(mmap))
     }
-}
-
-fn write_split_pcap(
-    output_dir: &PathBuf,
-    flows: impl IntoIterator<Item = (String, flow::FlowState)>,
-    link_type: u32,
-    buffer_size: usize,
-) -> Result<()> {
-    fs::create_dir_all(output_dir)?;
-    for (_key, flow) in flows {
-        if flow.packet_count > 0 {
-            write_flow_pcap(output_dir, &flow, link_type, buffer_size)?;
-        }
-    }
-    tracing::info!("PCAP output written to {:?}", output_dir);
-    Ok(())
-}
-
-fn write_split_l7(
-    output_dir: &PathBuf,
-    flows: impl IntoIterator<Item = (String, flow::FlowState)>,
-    buffer_size: usize,
-) -> Result<()> {
-    fs::create_dir_all(output_dir)?;
-    for (_key, flow) in flows {
-        if flow.packet_count > 0 {
-            write_flow_l7(output_dir, &flow, buffer_size)?;
-        }
-    }
-    tracing::info!("L7 output written to {:?}", output_dir);
-    Ok(())
 }
 
 /// ── Archive mode: stream packets into a single .rsplit file ──

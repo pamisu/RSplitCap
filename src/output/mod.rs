@@ -16,6 +16,17 @@ pub fn write_flow_pcap(
     link_type: u32,
     buffer_size: usize,
 ) -> Result<()> {
+    write_flow_pcap_prefixed(output_dir, flow, link_type, buffer_size, None)
+}
+
+/// Write a complete flow to a PCAP file, with optional filename prefix.
+pub fn write_flow_pcap_prefixed(
+    output_dir: &Path,
+    flow: &FlowState,
+    link_type: u32,
+    buffer_size: usize,
+    prefix: Option<&str>,
+) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
     let key = flow
@@ -29,11 +40,14 @@ pub fn write_flow_pcap(
         })
         .unwrap_or_else(|| format!("flow_{}", flow.flow_id));
 
-    let filename = sanitize_filename(&key);
-    let final_path = output_dir.join(format!("{}.pcap", filename));
+    let fname = match prefix {
+        Some(p) => format!("{p}_{}", sanitize_filename(&key)),
+        None => sanitize_filename(&key),
+    };
+    let final_path = output_dir.join(format!("{fname}.pcap"));
 
     // Write to temp file first, then rename atomically
-    let tmp_path = output_dir.join(format!(".{}.pcap.tmp", filename));
+    let tmp_path = output_dir.join(format!(".{fname}.pcap.tmp"));
     let file = std::fs::File::create(&tmp_path)
         .with_context(|| format!("Failed to create temp file {:?}", tmp_path))?;
     let mut writer = BufWriter::with_capacity(buffer_size, file);
@@ -59,9 +73,14 @@ pub fn write_flow_pcap(
 
 /// Write L7 payload for a flow to a file (atomic temp-file + rename).
 pub fn write_flow_l7(output_dir: &Path, flow: &FlowState, buffer_size: usize) -> Result<()> {
+    write_flow_l7_prefixed(output_dir, flow, buffer_size, None)
+}
+
+/// Write L7 payload for a flow to a file, with optional filename prefix.
+pub fn write_flow_l7_prefixed(output_dir: &Path, flow: &FlowState, buffer_size: usize, prefix: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
-    let filename = flow
+    let key = flow
         .five_tuple
         .map(|ft| {
             let sk = ft.session_key();
@@ -72,9 +91,12 @@ pub fn write_flow_l7(output_dir: &Path, flow: &FlowState, buffer_size: usize) ->
         })
         .unwrap_or_else(|| format!("flow_{}", flow.flow_id));
 
-    let safe_name = sanitize_filename(&filename);
-    let final_path = output_dir.join(format!("{}.l7", safe_name));
-    let tmp_path = output_dir.join(format!(".{}.l7.tmp", safe_name));
+    let fname = match prefix {
+        Some(p) => format!("{p}_{}", sanitize_filename(&key)),
+        None => sanitize_filename(&key),
+    };
+    let final_path = output_dir.join(format!("{fname}.l7"));
+    let tmp_path = output_dir.join(format!(".{fname}.l7.tmp"));
 
     let file = std::fs::File::create(&tmp_path)?;
     let mut writer = BufWriter::with_capacity(buffer_size, file);
@@ -121,6 +143,7 @@ fn sanitize_filename(name: &str) -> String {
                 || c == '<'
                 || c == '>'
                 || c == '|'
+                || c == '.'
         },
         "_",
     )

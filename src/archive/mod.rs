@@ -316,6 +316,226 @@ pub fn decode_offsets(data: &[u8], count: usize) -> Vec<u64> {
     offsets
 }
 
+// ── Secondary Indexes ──
+
+/// Header for the secondary indexes region (36 bytes).
+pub const SEC_IDX_HEADER_SIZE: usize = 36;
+
+/// Build all three secondary indexes from flow entries.
+pub struct SecondaryIndexBuilder {
+    /// (ip_bytes, flow_id)
+    ip_entries: Vec<([u8; 16], u64)>,
+    /// (port, flow_id)
+    port_entries: Vec<(u16, u64)>,
+    /// (protocol, flow_id)
+    proto_entries: Vec<(u8, u64)>,
+}
+
+impl SecondaryIndexBuilder {
+    pub fn new() -> Self {
+        Self {
+            ip_entries: Vec::new(),
+            port_entries: Vec::new(),
+            proto_entries: Vec::new(),
+        }
+    }
+
+    pub fn add_flow(&mut self, entry: &FlowEntry) {
+        self.ip_entries.push((entry.src_ip, entry.flow_id));
+        self.ip_entries.push((entry.dst_ip, entry.flow_id));
+        self.port_entries.push((entry.src_port, entry.flow_id));
+        self.port_entries.push((entry.dst_port, entry.flow_id));
+        self.proto_entries.push((entry.protocol, entry.flow_id));
+    }
+
+    /// Encode all indexes into a byte buffer. Returns (header_36b, index_data).
+    pub fn build(mut self) -> (Vec<u8>, Vec<u8>) {
+        // Sort and dedup
+        self.ip_entries.sort_by_key(|(ip, id)| (*ip, *id));
+        self.ip_entries.dedup();
+        self.port_entries.sort_by_key(|(p, id)| (*p, *id));
+        self.port_entries.dedup();
+        self.proto_entries.sort_by_key(|(p, id)| (*p, *id));
+        self.proto_entries.dedup();
+
+        let mut data = Vec::new();
+        let ip_off = data.len() as u64;
+        encode_ip_index(&self.ip_entries, &mut data);
+        let ip_size = data.len() as u32 - ip_off as u32;
+
+        let port_off = data.len() as u64;
+        encode_port_index(&self.port_entries, &mut data);
+        let port_size = data.len() as u32 - port_off as u32;
+
+        let proto_off = data.len() as u64;
+        encode_proto_index(&self.proto_entries, &mut data);
+        let proto_size = data.len() as u32 - proto_off as u32;
+
+        let mut header = Vec::with_capacity(SEC_IDX_HEADER_SIZE);
+        header.extend_from_slice(&ip_off.to_le_bytes());
+        header.extend_from_slice(&ip_size.to_le_bytes());
+        header.extend_from_slice(&port_off.to_le_bytes());
+        header.extend_from_slice(&port_size.to_le_bytes());
+        header.extend_from_slice(&proto_off.to_le_bytes());
+        header.extend_from_slice(&proto_size.to_le_bytes());
+
+        (header, data)
+    }
+}
+
+fn encode_ip_index(entries: &[([u8; 16], u64)], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut i = 0;
+    while i < entries.len() {
+        let ip = entries[i].0;
+        let mut ids = Vec::new();
+        while i < entries.len() && entries[i].0 == ip {
+            ids.push(entries[i].1);
+            i += 1;
+        }
+        ids.sort();
+        ids.dedup();
+        out.extend_from_slice(&ip);
+        out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in &ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+}
+
+fn encode_port_index(entries: &[(u16, u64)], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut i = 0;
+    while i < entries.len() {
+        let port = entries[i].0;
+        let mut ids = Vec::new();
+        while i < entries.len() && entries[i].0 == port {
+            ids.push(entries[i].1);
+            i += 1;
+        }
+        ids.sort();
+        ids.dedup();
+        out.extend_from_slice(&port.to_le_bytes());
+        out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in &ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+}
+
+fn encode_proto_index(entries: &[(u8, u64)], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut i = 0;
+    while i < entries.len() {
+        let proto = entries[i].0;
+        let mut ids = Vec::new();
+        while i < entries.len() && entries[i].0 == proto {
+            ids.push(entries[i].1);
+            i += 1;
+        }
+        ids.sort();
+        ids.dedup();
+        out.push(proto);
+        out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in &ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+}
+
+/// Parse secondary indexes from raw bytes (header + data).
+pub struct SecondaryIndexes {
+    data: Vec<u8>,
+    ip_off: u64,
+    ip_size: u32,
+    port_off: u64,
+    port_size: u32,
+    proto_off: u64,
+    proto_size: u32,
+}
+
+impl SecondaryIndexes {
+    pub fn parse(header_and_data: &[u8]) -> Option<Self> {
+        if header_and_data.len() < SEC_IDX_HEADER_SIZE {
+            return None;
+        }
+        let ip_off = u64::from_le_bytes(header_and_data[0..8].try_into().ok()?);
+        let ip_size = u32::from_le_bytes(header_and_data[8..12].try_into().ok()?);
+        let port_off = u64::from_le_bytes(header_and_data[12..20].try_into().ok()?);
+        let port_size = u32::from_le_bytes(header_and_data[20..24].try_into().ok()?);
+        let proto_off = u64::from_le_bytes(header_and_data[24..32].try_into().ok()?);
+        let proto_size = u32::from_le_bytes(header_and_data[32..36].try_into().ok()?);
+        Some(Self {
+            data: header_and_data.to_vec(),
+            ip_off,
+            ip_size,
+            port_off,
+            port_size,
+            proto_off,
+            proto_size,
+        })
+    }
+
+    /// Look up flow IDs by IP. Returns sorted, deduplicated list.
+    pub fn lookup_ip(&self, ip_bytes: &[u8; 16]) -> Vec<u64> {
+        lookup_generic(&self.data, self.ip_off, self.ip_size, 16, ip_bytes)
+    }
+
+    /// Look up flow IDs by port.
+    pub fn lookup_port(&self, port: u16) -> Vec<u64> {
+        let key = port.to_le_bytes();
+        lookup_generic(&self.data, self.port_off, self.port_size, 2, &key)
+    }
+
+    /// Look up flow IDs by protocol.
+    pub fn lookup_proto(&self, proto: u8) -> Vec<u64> {
+        lookup_generic(&self.data, self.proto_off, self.proto_size, 1, &[proto])
+    }
+}
+
+/// Generic linear scan (sorted keys) for secondary index lookup.
+/// `offset` and `size` are relative to the data portion (after the 36-byte header).
+fn lookup_generic(data: &[u8], offset: u64, size: u32, key_len: usize, key: &[u8]) -> Vec<u64> {
+    if size < 4 || key_len == 0 {
+        return Vec::new();
+    }
+    // Offsets are relative to data portion, but `data` includes the 36-byte header
+    let base = SEC_IDX_HEADER_SIZE;
+    let start = base + offset as usize;
+    let end = start + size as usize;
+    if end > data.len() {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(data[start..start + 4].try_into().unwrap()) as usize;
+    let mut pos = start + 4;
+
+    for _ in 0..count {
+        if pos + key_len + 4 > end {
+            break;
+        }
+        let entry_key = &data[pos..pos + key_len];
+        pos += key_len;
+        let flow_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let ids_end = pos + flow_count * 8;
+        if ids_end > end {
+            break;
+        }
+        if entry_key == key {
+            let mut ids = Vec::with_capacity(flow_count);
+            for j in 0..flow_count {
+                let id = u64::from_le_bytes(
+                    data[pos + j * 8..pos + j * 8 + 8].try_into().unwrap(),
+                );
+                ids.push(id);
+            }
+            return ids;
+        }
+        pos = ids_end;
+    }
+    Vec::new()
+}
+
 fn leb128_bytes_len(value: u64) -> usize {
     if value == 0 {
         return 1;

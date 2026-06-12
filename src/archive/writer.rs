@@ -1,7 +1,8 @@
 //! Archive writer — streams packets to a `.rsplit` file with post-positioned indexes.
 
 use super::{
-    encode_offsets, FileFooter, FileHeader, FlowEntry, HEADER_SIZE, FLOW_ENTRY_SIZE,
+    encode_offsets, FileFooter, FileHeader, FlowEntry, SecondaryIndexBuilder, HEADER_SIZE,
+    FLOW_ENTRY_SIZE,
 };
 use crate::packet::Packet;
 use anyhow::{Context, Result};
@@ -45,22 +46,26 @@ impl FlowState {
 /// Two-phase archive writer.
 ///
 /// Phase 1: stream packets sequentially, tracking per-flow offsets.
-/// Phase 2: finalize — write offset lists, flow table, and footer.
+/// Phase 2: finalize — write offset lists, flow table, secondary indexes, footer,
+///          then atomically rename temp file to final path.
 pub struct ArchiveWriter {
     writer: BufWriter<File>,
-    /// Current write position within the file.
     file_pos: u64,
-    /// Offset where Packet Region starts (right after header).
     packet_region_start: u64,
-    /// Per-flow tracking, keyed by group key.
     flows: HashMap<String, FlowState>,
     next_flow_id: u64,
+    build_secondary_index: bool,
+    tmp_path: String,
+    final_path: String,
 }
 
 impl ArchiveWriter {
-    /// Create a new archive writer and write the file header.
-    pub fn create(path: &str, link_type: u32) -> Result<Self> {
-        let file = File::create(path).context("Failed to create archive file")?;
+    /// Create a new archive writer. Writes to a temp file, renames on finalize.
+    pub fn create(path: &str, link_type: u32, build_secondary_index: bool) -> Result<Self> {
+        let final_path = path.to_string();
+        let tmp_path = format!("{}.tmp", path);
+        let file = File::create(&tmp_path)
+            .with_context(|| format!("Failed to create temp archive file: {}", tmp_path))?;
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
         let header = FileHeader {
@@ -77,6 +82,9 @@ impl ArchiveWriter {
             packet_region_start: HEADER_SIZE as u64,
             flows: HashMap::new(),
             next_flow_id: 1,
+            build_secondary_index,
+            tmp_path,
+            final_path,
         })
     }
 
@@ -161,6 +169,27 @@ impl ArchiveWriter {
         self.file_pos += flow_table_size;
         self.writer.flush()?;
 
+        // ── Secondary Indexes (optional) ──
+        let (sec_idx_offset, sec_idx_size) = if self.build_secondary_index {
+            let offset = self.file_pos;
+            let mut builder = SecondaryIndexBuilder::new();
+            for (entry_bytes, _) in &entries {
+                if let Some(entry) = FlowEntry::from_bytes(entry_bytes) {
+                    builder.add_flow(&entry);
+                }
+            }
+            let (header, data) = builder.build();
+            self.writer.write_all(&header)?;
+            self.writer.write_all(&data)?;
+            let size = (header.len() + data.len()) as u64;
+            self.file_pos += size;
+            self.writer.flush()?;
+            tracing::info!("Secondary indexes: {} bytes", size);
+            (offset, size)
+        } else {
+            (0u64, 0u64)
+        };
+
         // ── Footer ──
         let footer = FileFooter {
             packet_region_offset: self.packet_region_start,
@@ -170,8 +199,8 @@ impl ArchiveWriter {
             flow_table_offset,
             flow_table_size,
             flow_count,
-            secondary_index_offset: 0,
-            secondary_index_size: 0,
+            secondary_index_offset: sec_idx_offset,
+            secondary_index_size: sec_idx_size,
             ..Default::default()
         };
 
@@ -186,6 +215,11 @@ impl ArchiveWriter {
             packet_region_size,
             flow_table_size
         );
+
+        // Atomic rename: temp -> final
+        drop(self.writer);
+        std::fs::rename(&self.tmp_path, &self.final_path)
+            .with_context(|| format!("Failed to rename {} -> {}", self.tmp_path, self.final_path))?;
 
         Ok(())
     }

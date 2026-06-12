@@ -1,69 +1,86 @@
-//! Split-file PCAP output writer.
-//! Writes each flow/group to a separate PCAP file, buffering writes.
+//! Split-file PCAP output writer (buffered, atomic writes).
+//! Used for streaming output where flows are written incrementally.
+//! Currently the main split path uses `write_flow_pcap` directly;
+//! this module provides the building blocks for future streaming split mode.
 
-use super::OutputWriter;
 use crate::output::write_pcap_header;
 use anyhow::Result;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+/// Buffered per-group PCAP writer with atomic temp-file + rename.
 pub struct SplitWriter {
     output_dir: PathBuf,
     link_type: u32,
     buffer_size: usize,
     writers: HashMap<String, BufWriter<File>>,
+    /// Track temp paths for atomic rename on close.
+    temp_paths: HashMap<String, (PathBuf, PathBuf)>, // (tmp, final)
 }
 
 impl SplitWriter {
     pub fn new(output_dir: PathBuf, link_type: u32, buffer_size: usize) -> Result<Self> {
-        fs::create_dir_all(&output_dir)?;
+        std::fs::create_dir_all(&output_dir)?;
         Ok(Self {
             output_dir,
             link_type,
             buffer_size,
             writers: HashMap::new(),
+            temp_paths: HashMap::new(),
         })
     }
 
-    fn get_writer(&mut self, key: &str) -> Result<&mut BufWriter<File>> {
-        let dir = self.output_dir.clone();
-        let lt = self.link_type;
-        let bs = self.buffer_size;
-        if !self.writers.contains_key(key) {
-            let filename = sanitize_key(key);
-            let path = dir.join(format!("{}.pcap", filename));
-            let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    pub fn write_packet(
+        &mut self,
+        group_key: &str,
+        ts_sec: u32,
+        ts_usec: u32,
+        cap_len: u32,
+        orig_len: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        if !self.writers.contains_key(group_key) {
+            let safe = sanitize_key(group_key);
+            let final_path = self.output_dir.join(format!("{}.pcap", safe));
+            let tmp_path = self.output_dir.join(format!(".{}.pcap.tmp", safe));
 
-            let needs_header = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
-            let mut writer = BufWriter::with_capacity(bs, file);
-            if needs_header {
-                write_pcap_header(&mut writer, lt)?;
-            }
-            self.writers.insert(key.to_string(), writer);
+            let file = File::create(&tmp_path)?;
+            let mut w = BufWriter::with_capacity(self.buffer_size, file);
+            write_pcap_header(&mut w, self.link_type)?;
+            self.writers.insert(group_key.to_string(), w);
+            self.temp_paths
+                .insert(group_key.to_string(), (tmp_path, final_path));
         }
-        Ok(self.writers.get_mut(key).unwrap())
-    }
-}
 
-impl OutputWriter for SplitWriter {
-    fn write_packet(&mut self, group_key: &str, data: &[u8]) -> Result<()> {
-        let w = self.get_writer(group_key)?;
+        let w = self.writers.get_mut(group_key).unwrap();
+        w.write_all(&ts_sec.to_le_bytes())?;
+        w.write_all(&ts_usec.to_le_bytes())?;
+        w.write_all(&cap_len.to_le_bytes())?;
+        w.write_all(&orig_len.to_le_bytes())?;
         w.write_all(data)?;
         Ok(())
     }
 
-    fn flush_all(&mut self) -> Result<()> {
-        for (_, w) in self.writers.iter_mut() {
+    pub fn flush_all(&mut self) -> Result<()> {
+        for w in self.writers.values_mut() {
             w.flush()?;
         }
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> {
+    /// Close all files and atomically rename temp -> final.
+    pub fn close(mut self) -> Result<()> {
         self.flush_all()?;
-        self.writers.clear();
+        for (_, w) in self.writers.drain() {
+            drop(w);
+        }
+        for (_, (tmp, final_path)) in self.temp_paths.drain() {
+            if tmp.exists() {
+                std::fs::rename(&tmp, &final_path)?;
+            }
+        }
         Ok(())
     }
 }

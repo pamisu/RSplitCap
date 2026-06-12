@@ -15,7 +15,7 @@ mod parser;
 use crate::cli::{GroupArg, Mode, OutputType};
 use crate::filter::Filter;
 use crate::flow::FlowManager;
-use crate::output::write_flow_pcap;
+use crate::output::{write_flow_l7, write_flow_pcap};
 use crate::parser::open_reader;
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -204,10 +204,10 @@ fn run_split(
     // Phase 2: write output
     match output_type {
         OutputType::Pcap => {
-            write_split_pcap(output_dir, flow_mgr.into_flows(), link_type)?;
+            write_split_pcap(output_dir, flow_mgr.into_flows(), link_type, cli.buffer_bytes)?;
         }
         OutputType::L7 => {
-            write_split_l7(output_dir, flow_mgr.into_flows())?;
+            write_split_l7(output_dir, flow_mgr.into_flows(), cli.buffer_bytes)?;
         }
     }
 
@@ -234,11 +234,12 @@ fn write_split_pcap(
     output_dir: &PathBuf,
     flows: impl IntoIterator<Item = (String, flow::FlowState)>,
     link_type: u32,
+    buffer_size: usize,
 ) -> Result<()> {
     fs::create_dir_all(output_dir)?;
     for (_key, flow) in flows {
         if flow.packet_count > 0 {
-            write_flow_pcap(output_dir, &flow, link_type)?;
+            write_flow_pcap(output_dir, &flow, link_type, buffer_size)?;
         }
     }
     tracing::info!("PCAP output written to {:?}", output_dir);
@@ -248,34 +249,12 @@ fn write_split_pcap(
 fn write_split_l7(
     output_dir: &PathBuf,
     flows: impl IntoIterator<Item = (String, flow::FlowState)>,
+    buffer_size: usize,
 ) -> Result<()> {
     fs::create_dir_all(output_dir)?;
     for (_key, flow) in flows {
-        if flow.packet_count == 0 {
-            continue;
-        }
-        let filename = flow
-            .five_tuple
-            .map(|ft| {
-                let sk = ft.session_key();
-                format!(
-                    "{}_{}_{}_{}_{}",
-                    sk.protocol, sk.src_ip, sk.dst_ip, sk.src_port, sk.dst_port
-                )
-            })
-            .unwrap_or_else(|| format!("flow_{}", flow.flow_id));
-
-        let safe_name = sanitize_filename(&filename);
-        let path = output_dir.join(format!("{}.l7", safe_name));
-
-        let mut content = Vec::new();
-        for pkt in &flow.packets {
-            if let Some(l7) = pkt.l7_data() {
-                content.extend_from_slice(l7);
-            }
-        }
-        if !content.is_empty() {
-            fs::write(&path, &content)?;
+        if flow.packet_count > 0 {
+            write_flow_l7(output_dir, &flow, buffer_size)?;
         }
     }
     tracing::info!("L7 output written to {:?}", output_dir);
@@ -328,7 +307,8 @@ fn run_archive(cli: &cli::Cli, group: &GroupArg) -> Result<()> {
     let mut reader = open_reader(data)?;
     let link_type = reader.link_type();
     let mut flow_mgr = FlowManager::new(group, cli.max_sessions);
-    let mut writer = ArchiveWriter::create(archive_path, link_type)?;
+    let build_sec = !cli.no_secondary_index;
+    let mut writer = ArchiveWriter::create(archive_path, link_type, build_sec)?;
 
     let mut processed = 0u64;
     let mut filtered = 0u64;
@@ -426,7 +406,7 @@ fn run_extract(cli: &cli::Cli) -> Result<()> {
     if !cli.filter_ip.is_empty() {
         for ip_str in &cli.filter_ip {
             let ip: IpAddr = ip_str.parse().context("Invalid filter IP")?;
-            let ids: Vec<u64> = reader.find_by_ip(ip).iter().map(|e| e.flow_id).collect();
+            let ids = reader.find_by_ip(ip);
             if target_flows.is_empty() {
                 target_flows = ids;
             } else {
@@ -437,7 +417,7 @@ fn run_extract(cli: &cli::Cli) -> Result<()> {
 
     if !cli.filter_port.is_empty() {
         for &port in &cli.filter_port {
-            let ids: Vec<u64> = reader.find_by_port(port).iter().map(|e| e.flow_id).collect();
+            let ids = reader.find_by_port(port);
             if target_flows.is_empty() {
                 target_flows = ids;
             } else {
@@ -453,11 +433,7 @@ fn run_extract(cli: &cli::Cli) -> Result<()> {
             "icmp" => 1,
             _ => anyhow::bail!("Unknown protocol: {}", proto_str),
         };
-        let ids: Vec<u64> = reader
-            .find_by_protocol(proto_num)
-            .iter()
-            .map(|e| e.flow_id)
-            .collect();
+        let ids = reader.find_by_protocol(proto_num);
         if target_flows.is_empty() {
             target_flows = ids;
         } else {

@@ -1,6 +1,8 @@
 //! Archive reader — open a `.rsplit` file, parse indexes, extract flows.
 
-use super::{decode_offsets, FileFooter, FlowEntry, FOOTER_SIZE, FLOW_ENTRY_SIZE};
+use super::{
+    decode_offsets, FileFooter, FlowEntry, SecondaryIndexes, FOOTER_SIZE, FLOW_ENTRY_SIZE,
+};
 use anyhow::{Context, Result};
 use memmap2::Mmap;
 use std::fs::File;
@@ -11,10 +13,11 @@ use std::path::Path;
 /// Opened archive with memory-mapped access.
 pub struct ArchiveReader {
     mmap: Mmap,
-    footer: FileFooter,
+    _footer: FileFooter,
     link_type: u32,
-    /// Parsed flow entries for quick lookup.
     entries: Vec<FlowEntry>,
+    /// Secondary indexes (None if not built or empty).
+    sec_indexes: Option<SecondaryIndexes>,
 }
 
 impl ArchiveReader {
@@ -34,7 +37,7 @@ impl ArchiveReader {
         let link_type = if mmap.len() >= 64 {
             u32::from_le_bytes(mmap[12..16].try_into().unwrap())
         } else {
-            1 // default Ethernet
+            1
         };
 
         // Read footer (last 128 bytes)
@@ -57,23 +60,33 @@ impl ArchiveReader {
             pos += FLOW_ENTRY_SIZE;
         }
 
+        // Parse secondary indexes if present
+        let sec_indexes = if footer.secondary_index_offset > 0 && footer.secondary_index_size > 0 {
+            let si_start = footer.secondary_index_offset as usize;
+            let si_end = si_start + footer.secondary_index_size as usize;
+            if si_end <= mmap.len() {
+                SecondaryIndexes::parse(&mmap[si_start..si_end])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         tracing::info!(
-            "Opened archive: {} flows, packet region {} bytes",
+            "Opened archive: {} flows, packet region {} bytes, indexes: {}",
             entries.len(),
-            footer.packet_region_size
+            footer.packet_region_size,
+            if sec_indexes.is_some() { "yes" } else { "no" }
         );
 
         Ok(Self {
             mmap,
-            footer,
+            _footer: footer,
             link_type,
             entries,
+            sec_indexes,
         })
-    }
-
-    /// Return the number of flows in the archive.
-    pub fn flow_count(&self) -> usize {
-        self.entries.len()
     }
 
     /// List all flow entries.
@@ -86,26 +99,42 @@ impl ArchiveReader {
         self.entries.iter().find(|e| e.flow_id == flow_id)
     }
 
-    /// Find flows matching an IP address.
-    pub fn find_by_ip(&self, ip: IpAddr) -> Vec<&FlowEntry> {
+    /// Find flows matching an IP address. Uses secondary index if available.
+    pub fn find_by_ip(&self, ip: IpAddr) -> Vec<u64> {
         let ip_bytes = ip_to_bytes(ip);
+        if let Some(ref idx) = self.sec_indexes {
+            return idx.lookup_ip(&ip_bytes);
+        }
+        // Fallback: linear scan
         self.entries
             .iter()
             .filter(|e| e.src_ip == ip_bytes || e.dst_ip == ip_bytes)
+            .map(|e| e.flow_id)
             .collect()
     }
 
-    /// Find flows matching a port number.
-    pub fn find_by_port(&self, port: u16) -> Vec<&FlowEntry> {
+    /// Find flows matching a port number. Uses secondary index if available.
+    pub fn find_by_port(&self, port: u16) -> Vec<u64> {
+        if let Some(ref idx) = self.sec_indexes {
+            return idx.lookup_port(port);
+        }
         self.entries
             .iter()
             .filter(|e| e.src_port == port || e.dst_port == port)
+            .map(|e| e.flow_id)
             .collect()
     }
 
-    /// Find flows matching a protocol.
-    pub fn find_by_protocol(&self, proto: u8) -> Vec<&FlowEntry> {
-        self.entries.iter().filter(|e| e.protocol == proto).collect()
+    /// Find flows matching a protocol. Uses secondary index if available.
+    pub fn find_by_protocol(&self, proto: u8) -> Vec<u64> {
+        if let Some(ref idx) = self.sec_indexes {
+            return idx.lookup_proto(proto);
+        }
+        self.entries
+            .iter()
+            .filter(|e| e.protocol == proto)
+            .map(|e| e.flow_id)
+            .collect()
     }
 
     /// Decode the packet offsets for a given flow entry.
@@ -130,18 +159,17 @@ impl ArchiveReader {
         let offsets = self.get_packet_offsets(entry)?;
 
         // Write PCAP global header
-        writer.write_all(&0xA1B2C3D4u32.to_le_bytes())?; // magic
-        writer.write_all(&2u16.to_le_bytes())?; // version major
-        writer.write_all(&4u16.to_le_bytes())?; // version minor
-        writer.write_all(&0i32.to_le_bytes())?; // timezone
-        writer.write_all(&0u32.to_le_bytes())?; // sigfigs
-        writer.write_all(&65535u32.to_le_bytes())?; // snaplen
-        writer.write_all(&self.link_type.to_le_bytes())?; // link type
+        writer.write_all(&0xA1B2C3D4u32.to_le_bytes())?;
+        writer.write_all(&2u16.to_le_bytes())?;
+        writer.write_all(&4u16.to_le_bytes())?;
+        writer.write_all(&0i32.to_le_bytes())?;
+        writer.write_all(&0u32.to_le_bytes())?;
+        writer.write_all(&65535u32.to_le_bytes())?;
+        writer.write_all(&self.link_type.to_le_bytes())?;
 
         // Copy each PCAP frame from the packet region
         for &offset in &offsets {
             let pos = offset as usize;
-            // PCAP frame: ts_sec(4) + ts_usec(4) + incl_len(4) + orig_len(4) + data
             if pos + 16 > self.mmap.len() {
                 break;
             }
@@ -166,7 +194,7 @@ impl ArchiveReader {
     }
 }
 
-// Re-export ip_to_bytes for reader use
+/// Convert IP address to 16-byte format (IPv4-mapped IPv6).
 pub fn ip_to_bytes(ip: IpAddr) -> [u8; 16] {
     match ip {
         IpAddr::V4(v4) => {

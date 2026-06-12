@@ -1,0 +1,24 @@
+# Build artifacts
+/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.rsplit
+*.pcap
+*.pcapng
+*.cap
+/tmp/
+
+# Environment
+.env
+.env.local

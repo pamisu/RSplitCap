@@ -22,3 +22,17 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Benchmark data (keep script and reports, ignore datasets and binaries)
+bench/USTC-TFC2016-master/
+bench/USTC-TFC2016-master.rar
+bench/SplitCap.exe
+bench/**/runs/
+bench/.wine32/
+
+# Python
+__pycache__/
+*.pyc
+
+# Cross-compile config (machine-specific paths)
+.cargo/config.toml

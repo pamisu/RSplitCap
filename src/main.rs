@@ -29,8 +29,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn main() -> Result<()> {
-    // Init tracing
+    // Init tracing — write to stderr so stdout stays clean for data output
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -462,6 +463,11 @@ fn run_extract(cli: &cli::Cli) -> Result<()> {
     use std::net::IpAddr;
 
     let archive_path = cli.archive_file.as_deref().context("--archive <FILE> is required for extract mode")?;
+
+    if cli.pipe {
+        return run_pipe(&PathBuf::from(archive_path));
+    }
+
     let reader = ArchiveReader::open(&PathBuf::from(archive_path))?;
 
     // List flows
@@ -568,6 +574,50 @@ fn run_extract(cli: &cli::Cli) -> Result<()> {
         output_dir
     );
 
+    Ok(())
+}
+
+/// ── Pipe mode: output each flow as a length-prefixed complete pcap to stdout ──
+fn run_pipe(archive_path: &Path) -> Result<()> {
+    use crate::archive::reader::ArchiveReader;
+    use std::io::{BufWriter, Write};
+
+    let reader = ArchiveReader::open(archive_path)?;
+    let link_type = reader.link_type();
+    let mut stdout = BufWriter::new(std::io::stdout());
+
+    for entry in reader.list_flows() {
+        let offsets = reader.get_packet_offsets(entry)?;
+
+        // Build the complete pcap in memory:
+        //   [24B global header] + [frame 1] + [frame 2] + ...
+        let mut pcap_data = Vec::with_capacity(
+            24 + offsets.len() * 1500, // rough estimate
+        );
+
+        // PCAP global header (24 bytes)
+        pcap_data.extend_from_slice(&0xA1B2C3D4u32.to_le_bytes()); // magic
+        pcap_data.extend_from_slice(&2u16.to_le_bytes());          // version major
+        pcap_data.extend_from_slice(&4u16.to_le_bytes());          // version minor
+        pcap_data.extend_from_slice(&0i32.to_le_bytes());          // thiszone (GMT)
+        pcap_data.extend_from_slice(&0u32.to_le_bytes());          // sigfigs
+        pcap_data.extend_from_slice(&65535u32.to_le_bytes());      // snaplen
+        pcap_data.extend_from_slice(&link_type.to_le_bytes());     // link type
+
+        // Copy each frame
+        for &offset in &offsets {
+            if let Some(frame) = reader.read_frame_bytes(offset) {
+                pcap_data.extend_from_slice(frame);
+            }
+        }
+
+        // Write length prefix + pcap data
+        let len_bytes = (pcap_data.len() as u64).to_le_bytes();
+        stdout.write_all(&len_bytes)?;
+        stdout.write_all(&pcap_data)?;
+    }
+
+    stdout.flush()?;
     Ok(())
 }
 

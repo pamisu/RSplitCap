@@ -269,6 +269,84 @@ SplitCap -r dump.pcap -s session -o output/
 rsplitcap -r dump.pcap -s session -o output/
 ```
 
+## Python Library
+
+RSplitCap is also available as a native Python extension (PyO3 + maturin), enabling direct use from Python without CLI subprocess overhead.
+
+### Installation
+
+```bash
+pip install rsplitcap
+```
+
+### Quick Start
+
+```python
+import rsplitcap
+
+# Read pcap → get all flows directly
+archive = rsplitcap.read_flows("capture.pcap")
+for flow in archive.flows():
+    print(f"[{flow.id}] {flow.proto_name} "
+          f"{flow.src_addr}:{flow.src_port} -> {flow.dst_addr}:{flow.dst_port}")
+    for pkt in flow.packets():
+        process(pkt.data, pkt.ts)
+
+# Or from a pre-built archive
+archive = rsplitcap.Archive.open("data.rsplit")
+for flow in archive.flows():
+    for pkt in flow.packets():
+        process(pkt.data, pkt.ts)
+
+# Split pcap into per-flow files
+rsplitcap.split("capture.pcap", "./flows/", strategy="session")
+
+# Pipe mode: each flow as a complete pcap bytes
+for pcap_bytes in rsplitcap.pipe_archive("data.rsplit"):
+    # pcap_bytes is a valid standalone pcap file
+    process(pcap_bytes)
+
+# Filtering
+rsplitcap.read_flows("capture.pcap", ip_filters=["10.0.0.1"], port_filters=[80, 443])
+```
+
+### API Reference
+
+| Function / Class | Description |
+|-----------------|-------------|
+| `read_flows(path, strategy, max_sessions, ip_filters, port_filters)` | Read pcap → `Archive` directly |
+| `create_archive(input, output, strategy, ...)` | Create `.rsplit` from pcap |
+| `split(input, output_dir, strategy, ..., output_type)` | Split into per-flow pcap/L7 files |
+| `pipe_archive(path)` | Return `list[bytes]`, each a complete pcap |
+| `Archive.open(path)` | Open `.rsplit` for reading |
+| `Archive.flows()` | Get all `Flow` objects |
+| `Archive.get_flow(id)` | Get single flow by ID |
+| `Archive.find_by_ip(ip)` | Find flows by IP |
+| `Archive.find_by_port(port)` | Find flows by port |
+| `Archive.find_by_protocol("tcp"/"udp"/"icmp")` | Find flows by protocol |
+| `Flow.packets()` | Get all `Packet` objects |
+| `Packet.data` | Raw L2 frame bytes |
+| `Packet.ts` | Timestamp (float seconds) |
+
+### Building from Source
+
+```bash
+# Requires Rust 1.95+ and Python 3.8+
+RUSTFLAGS="-L /path/to/lib" cargo build --release --features python
+cp target/release/librsplitcap.so python/rsplitcap/_rsplitcap.abi3.so
+PYTHONPATH=$(pwd)/python python -c "import rsplitcap"
+```
+
+## Pipe Mode (CLI)
+
+Stream flows to stdout as length-prefixed pcap for pipeline processing:
+
+```bash
+rsplitcap --mode extract --archive data.rsplit --pipe | python process.py
+```
+
+Output format: `[8B length (u64 LE)][complete pcap file]...` — each flow is a standalone pcap, zero custom format.
+
 ## Roadmap
 
 - [x] PCAP reader & writer
@@ -285,10 +363,11 @@ rsplitcap -r dump.pcap -s session -o output/
 - [x] Pipelined streaming (parser thread + bounded channel + SplitWriter)
 - [x] Cross-platform benchmark suite (RSplitCap vs SplitCap, HTML report)
 - [x] Windows cross-compilation support (x86_64-pc-windows-gnu)
+- [x] Python bindings (PyO3 native extension)
+- [x] Pipe mode for stream processing
 - [ ] Windows MSVC native build performance validation
 - [ ] PCAP-NG WiFi data-packet IP parsing over LLC/SNAP
 - [ ] Compression support in archive
-- [ ] Python bindings
 
 ## License
 

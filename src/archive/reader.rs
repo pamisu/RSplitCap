@@ -89,6 +89,27 @@ impl ArchiveReader {
         })
     }
 
+    /// Get the link type from the archive header.
+    pub fn link_type(&self) -> u32 {
+        self.link_type
+    }
+
+    /// Read a complete PCAP frame (16B header + data) at the given byte offset
+    /// in the packet region. Returns None if the offset is out of bounds.
+    pub fn read_frame_bytes(&self, offset: u64) -> Option<&[u8]> {
+        let pos = offset as usize;
+        if pos + 16 > self.mmap.len() {
+            return None;
+        }
+        let incl_len =
+            u32::from_le_bytes(self.mmap[pos + 8..pos + 12].try_into().unwrap()) as usize;
+        let frame_end = pos + 16 + incl_len;
+        if frame_end > self.mmap.len() {
+            return None;
+        }
+        Some(&self.mmap[pos..frame_end])
+    }
+
     /// List all flow entries.
     pub fn list_flows(&self) -> &[FlowEntry] {
         &self.entries

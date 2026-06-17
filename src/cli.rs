@@ -95,6 +95,10 @@ pub struct Cli {
     #[arg(long = "no-pipeline")]
     pub no_pipeline: bool,
 
+    /// Pipe mode: output each flow to stdout as length-prefixed pcap
+    #[arg(long = "pipe")]
+    pub pipe: bool,
+
     /// Verbose output
     #[arg(long = "verbose", short = 'v')]
     pub verbose: bool,

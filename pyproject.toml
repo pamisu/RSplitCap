@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rsplitcap"
+version = "0.1.0"
+description = "A fast PCAP/PCAP-NG splitter with archive capabilities — Python bindings"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"

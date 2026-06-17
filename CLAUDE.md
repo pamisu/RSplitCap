@@ -1,68 +1,74 @@
 # CLAUDE.md — RSplitCap project guide for Claude Code
 
 ## Project Overview
-RSplitCap is a Rust rewrite of SplitCap (Windows PCAP splitting tool), with added support for PCAP-NG and a custom single-file archive format (`.rsplit`).
+RSplitCap is a Rust rewrite of SplitCap (Windows PCAP splitting tool), with PCAP-NG support, a custom `.rsplit` single-file archive format, Python bindings (PyO3), and CLI pipe streaming.
 
-## Build & Test Commands
+## Build & Test
 ```bash
 cargo build                    # Debug build
 cargo build --release          # Release build (LTO, single codegen unit)
-cargo test                     # Run all tests (16 tests: 6 integration + 10 fuzz/robustness)
-cargo clippy -- -D warnings    # Lint (zero warnings enforced)
-RUST_LOG=debug cargo run -- <args>  # Verbose run
+cargo test                     # 16 tests: 6 integration + 10 fuzz/robustness
 
-# Windows cross-compile (from Linux/WSL2, requires mingw-w64)
-rustup target add x86_64-pc-windows-gnu
-# Install mingw-w64, then:
+# Python bindings
+cargo build --release --features python  # requires -L <libpython dir>
+maturin develop --release                 # build+install into venv
+
+# Cross-compile Windows (from Linux, requires mingw-w64)
 cargo build --release --target x86_64-pc-windows-gnu
-
-# Benchmark (requires Python 3.8+, matplotlib optional)
-python bench/bench_rsplitcap.py --data-dir <path_to_pcaps> \
-    --rsplitcap ./target/release/rsplitcap \
-    --splitcap ./path/to/SplitCap.exe \
-    --output ./bench_report
 ```
 
-## Benchmark Script (`bench/bench_rsplitcap.py`)
-- **Shared tests**: 6 grouping strategies × up to 3 files, IP/port filter tests, L7 output — RSplitCap vs SplitCap
-- **RSplitCap-unique tests**: BSSID strategy, archive create/extract, pipeline vs legacy, mmap vs no-mmap
-- **Metrics**: wall time, CPU time, peak RSS (via `/usr/bin/time -v`), output file count/size, packet count
-- **Output**: `report.html` (interactive charts with matplotlib) + `report.json` (machine-readable)
-- **Key options**: `--quick` (1+1 runs), `--max-files N`, `--no-splitcap`, `--skip-*`, `--timeout N`
-- On WSL2, SplitCap paths are auto-converted via `wslpath -w`; wine fallback if no WSL interop
-
-## Architecture (layered)
-1. **CLI** (`src/cli.rs`) — clap-based, normalizes SplitCap multi-char flags (`-ip`→`--ip`)
-2. **Parser** (`src/parser/`) — `CaptureReader` trait, PCAP + PCAP-NG (SHB/IDB/EPB/SPB)
-3. **Packet** (`src/packet.rs`) — unified Packet struct, Ethernet/IPv4/IPv6 parsing, WiFi 802.11 + radiotap
-4. **Filter** (`src/filter.rs`) — IP + port AND-logic whitelist
-5. **Flow Manager** (`src/flow/`) — 9 grouping strategies, LRU eviction via generation counter
-6. **Output** — Split mode (per-flow PCAP/L7), Archive mode (`.rsplit` with secondary indexes)
+## Architecture
+```
+src/
+├── main.rs              # Entry point, mode dispatch (split/archive/extract/pipe)
+├── cli.rs               # CLI parsing (clap), SplitCap flag normalization
+├── packet.rs            # Packet & FiveTuple, Ethernet/IPv4/IPv6/WiFi parsing
+├── filter.rs            # IP + port AND-logic whitelist
+├── parser/
+│   ├── mod.rs, pcap.rs, pcapng.rs   # CaptureReader trait, PCAP/PCAP-NG readers
+├── flow/
+│   ├── mod.rs, strategy.rs          # FlowManager (LRU), 9 grouping strategies
+├── output/
+│   ├── mod.rs, split.rs             # PCAP/L7 output, SplitWriter (streaming)
+├── archive/
+│   ├── mod.rs, writer.rs, reader.rs # .rsplit format, Delta+LEB128, secondary indexes
+└── python/
+    └── mod.rs           # PyO3 bindings (cfg-gated with --features python)
+tests/
+├── integration.rs       # 6 end-to-end tests
+└── fuzz_parsers.rs      # 10 fuzz/robustness tests
+bench/                   # Python benchmark suite
+python/
+├── rsplit_pipe_reader.py     # CLI --pipe mode stdin reader
+└── rsplitcap/
+    ├── __init__.py, __init__.pyi   # Python package entry + type stubs
+```
 
 ## Key Design Decisions
-- Input files are mmap'd via `memmap2` + `Bytes::from_owner` — zero-copy, OS-managed paging for >memory files.
-- Split mode uses pipelined streaming: parser in background thread (crossbeam bounded channel) → classify + write in main thread via `SplitWriter`. Packets written as they arrive, not accumulated.
-- Archive uses 2-phase write: sequential packets → post-positioned indexes (Delta+LEB128).
-- FlowEntry is fixed 96 bytes — enables O(1) random access in Flow Table.
-- IP addresses stored as 16 bytes (IPv4-mapped IPv6) for uniform handling.
-- `-s seconds N` and `-s packets N` use the `-s` flag with a sub-argument — manually parsed.
-- Secondary indexes: sorted key→[flow_id] maps for IP/port/protocol in archive (binary-searchable).
-- All file writes use atomic temp-file + rename pattern to prevent corruption on interrupt.
-- `--no-pipeline` flag falls back to legacy accumulate-then-write mode.
+- Input files mmap'd via `memmap2` + `Bytes::from_owner` (zero-copy, OS-paged).
+- Split mode: pipelined streaming via crossbeam bounded channel (parser thread → main).
+- Archive: 2-phase write (sequential packets → post-positioned Delta+LEB128 indexes).
+- FlowEntry: fixed 96 bytes for O(1) random access in Flow Table.
+- IP addresses: 16-byte IPv4-mapped IPv6 uniform representation.
+- File writes: atomic temp-file + rename pattern.
+- Tracing: writes to stderr so stdout stays clean for `--pipe` mode.
+- Python bindings: cfg-gated (`--features python`), `extension-module` for manylinux.
 
-## Module Map
-```
-main.rs ── cli ── filter ── flow (strategy + manager) ── output (split + mod)
-         ── parser (pcap + pcapng)                       ── archive (writer + reader + format)
-         ── packet (ethernet, ipv4, ipv6 ext hdrs, wifi 802.11 + radiotap)
-```
+## Python Bindings (`src/python/mod.rs`)
+- **ArchivePy**: wraps `ArchiveReader`, `open()`, `flows()`, `find_by_*()`, `get_flow()`
+- **FlowPy**: holds `Arc<ArchiveReader>` + `FlowEntry`, metadata + `packets()` → list[Packet]
+- **PacketPy**: `ts`, `data` (bytes), `length`, `orig_len`
+- **read_flows(path)**: pcap → temp .rsplit → Archive (temp auto-cleaned on Drop)
+- **create_archive/split/pipe_archive**: correspond to CLI modes
+
+## CI/CD (GitHub Actions)
+- Push → `cargo test`
+- Release → build CLI binaries (Linux x86_64, macOS ARM64, Windows x86_64) + Python wheels (3 platforms) → attach to release + publish to PyPI
+- PyPI secret: `PYPI_API_TOKEN`
 
 ## Known Gaps
-- LRU eviction is O(n) per eviction (fast in practice for default 10k max_sessions)
-- PCAP-NG: single interface only, no name resolution blocks
-- No WiFi data-frame IP parsing over LLC/SNAP (BSSID/mac extraction works; five-tuple returns None)
-- **Windows performance**: Cross-compiled `x86_64-pc-windows-gnu` binary is ~8× slower than Linux native. MSVC native build should restore full performance but has not been benchmarked yet. SplitCap runs 7.6× faster natively on Windows than via WSL2/Wine.
-
-## Test Coverage
-- `tests/integration.rs`: 6 tests (split, filter, L7, PCAP-NG, archive roundtrip, list-flows)
-- `tests/fuzz_parsers.rs`: 10 tests (random data PCAP/PCAP-NG parsers, malformed packets, LEB128 codec, FlowEntry roundtrip, corrupt archive rejection, WiFi radiotap/management BSSID, WiFi malformed, IPv6 extension header chain)
+- LRU eviction O(n) per eviction (fine for default 10k max_sessions)
+- PCAP-NG: single interface, no name resolution blocks
+- No WiFi data-frame IP parsing over LLC/SNAP
+- No compression in archive
+- Python bindings: `--no-secondary-index` not exposed, packets() copies data (no zero-copy)
